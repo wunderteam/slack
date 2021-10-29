@@ -2,9 +2,9 @@ package slack
 
 import (
 	"context"
-	"errors"
 	"net/url"
 	"strconv"
+	"time"
 )
 
 const (
@@ -48,23 +48,21 @@ func (api *Client) AddStarContext(ctx context.Context, channel string, item Item
 		"token":   {api.token},
 	}
 	if item.Timestamp != "" {
-		values.Set("timestamp", string(item.Timestamp))
+		values.Set("timestamp", item.Timestamp)
 	}
 	if item.File != "" {
-		values.Set("file", string(item.File))
+		values.Set("file", item.File)
 	}
 	if item.Comment != "" {
-		values.Set("file_comment", string(item.Comment))
+		values.Set("file_comment", item.Comment)
 	}
 
 	response := &SlackResponse{}
-	if err := post(ctx, api.httpclient, "stars.add", values, response, api.debug); err != nil {
+	if err := api.postMethod(ctx, "stars.add", values, response); err != nil {
 		return err
 	}
-	if !response.Ok {
-		return errors.New(response.Error)
-	}
-	return nil
+
+	return response.Err()
 }
 
 // RemoveStar removes a starred item from a channel
@@ -79,23 +77,21 @@ func (api *Client) RemoveStarContext(ctx context.Context, channel string, item I
 		"token":   {api.token},
 	}
 	if item.Timestamp != "" {
-		values.Set("timestamp", string(item.Timestamp))
+		values.Set("timestamp", item.Timestamp)
 	}
 	if item.File != "" {
-		values.Set("file", string(item.File))
+		values.Set("file", item.File)
 	}
 	if item.Comment != "" {
-		values.Set("file_comment", string(item.Comment))
+		values.Set("file_comment", item.Comment)
 	}
 
 	response := &SlackResponse{}
-	if err := post(ctx, api.httpclient, "stars.remove", values, response, api.debug); err != nil {
+	if err := api.postMethod(ctx, "stars.remove", values, response); err != nil {
 		return err
 	}
-	if !response.Ok {
-		return errors.New(response.Error)
-	}
-	return nil
+
+	return response.Err()
 }
 
 // ListStars returns information about the stars a user added
@@ -119,13 +115,15 @@ func (api *Client) ListStarsContext(ctx context.Context, params StarsParameters)
 	}
 
 	response := &listResponseFull{}
-	err := post(ctx, api.httpclient, "stars.list", values, response, api.debug)
+	err := api.postMethod(ctx, "stars.list", values, response)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !response.Ok {
-		return nil, nil, errors.New(response.Error)
+
+	if err := response.Err(); err != nil {
+		return nil, nil, err
 	}
+
 	return response.Items, &response.Paging, nil
 }
 
@@ -160,4 +158,106 @@ func (api *Client) GetStarredContext(ctx context.Context, params StarsParameters
 		starredItems[i] = StarredItem(item)
 	}
 	return starredItems, paging, nil
+}
+
+type listResponsePaginated struct {
+	Items []Item `json:"items"`
+	SlackResponse
+	Metadata ResponseMetadata `json:"response_metadata"`
+}
+
+// StarredItemPagination allows for paginating over the starred items
+type StarredItemPagination struct {
+	Items        []Item
+	limit        int
+	previousResp *ResponseMetadata
+	c            *Client
+}
+
+// ListStarsOption options for the GetUsers method call.
+type ListStarsOption func(*StarredItemPagination)
+
+// ListAllStars returns the complete list of starred items
+func (api *Client) ListAllStars() ([]Item, error) {
+	return api.ListAllStarsContext(context.Background())
+}
+
+// ListAllStarsContext returns the list of users (with their detailed information) with a custom context
+func (api *Client) ListAllStarsContext(ctx context.Context) (results []Item, err error) {
+	p := api.ListStarsPaginated()
+	for err == nil {
+		p, err = p.next(ctx)
+		if err == nil {
+			results = append(results, p.Items...)
+		} else if rateLimitedError, ok := err.(*RateLimitedError); ok {
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+			case <-time.After(rateLimitedError.RetryAfter):
+				err = nil
+			}
+		}
+	}
+
+	return results, p.failure(err)
+}
+
+// ListStarsPaginated fetches users in a paginated fashion, see ListStarsPaginationContext for usage.
+func (api *Client) ListStarsPaginated(options ...ListStarsOption) StarredItemPagination {
+	return newStarPagination(api, options...)
+}
+
+func newStarPagination(c *Client, options ...ListStarsOption) (sip StarredItemPagination) {
+	sip = StarredItemPagination{
+		c:     c,
+		limit: 200, // per slack api documentation.
+	}
+
+	for _, opt := range options {
+		opt(&sip)
+	}
+
+	return sip
+}
+
+// done checks if the pagination has completed
+func (StarredItemPagination) done(err error) bool {
+	return err == errPaginationComplete
+}
+
+// done checks if pagination failed.
+func (t StarredItemPagination) failure(err error) error {
+	if t.done(err) {
+		return nil
+	}
+
+	return err
+}
+
+// next gets the next list of starred items based on the cursor value
+func (t StarredItemPagination) next(ctx context.Context) (_ StarredItemPagination, err error) {
+	var (
+		resp *listResponsePaginated
+	)
+
+	if t.c == nil || (t.previousResp != nil && t.previousResp.Cursor == "") {
+		return t, errPaginationComplete
+	}
+
+	t.previousResp = t.previousResp.initialize()
+
+	values := url.Values{
+		"limit":  {strconv.Itoa(t.limit)},
+		"token":  {t.c.token},
+		"cursor": {t.previousResp.Cursor},
+	}
+
+	if err = t.c.postMethod(ctx, "stars.list", values, &resp); err != nil {
+		return t, err
+	}
+
+	t.previousResp = &resp.Metadata
+	t.Items = resp.Items
+
+	return t, nil
 }
